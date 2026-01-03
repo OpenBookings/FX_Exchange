@@ -1,5 +1,4 @@
 from typing import Optional
-import db
 
 def get_exchange_rate(currency_code: str, conn) -> Optional[float]:
     """Get the latest exchange rate for a currency from the database."""

@@ -25,9 +25,10 @@ def convert_amount():
     amount = float(flask.request.args.get("amount"))
     from_ccy = flask.request.args.get("from")
     to_ccy = flask.request.args.get("to")
+    method = 'production'
     
     try:
-        with db.get_db_connection() as conn:
+        with db.get_db_connection(method) as conn:
             result = convertion.convert_amount(amount, from_ccy, to_ccy, conn)
         return flask.jsonify({
             "amount": result,
@@ -38,4 +39,4 @@ def convert_amount():
         return flask.jsonify({"error": str(e)}), 400
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=8080)
