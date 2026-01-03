@@ -1,5 +1,5 @@
 fastapi
 uvicorn
 requests
-google-cloud-firestore
+psycopg2-binary
 python-dotenv

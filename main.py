@@ -1,31 +1,73 @@
 import os
 import io
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
 from typing import Dict, Optional
+from contextlib import contextmanager
 
 import requests
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 from fastapi import FastAPI, HTTPException, Query, Header
-from google.cloud import firestore
+import logging
+
+# Add after other imports
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="ECB FX Service", version="1.0.0")
 
 # ---- Config ----
-FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "fx_rates")
-UPDATE_TOKEN = os.getenv("UPDATE_TOKEN")  # set this in Cloud Run env vars
+UPDATE_TOKEN = os.getenv("UPDATE_TOKEN", "TESTING")  # set this in Cloud Run env vars
 ECB_CSV_URL = (
     "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A"
     "?format=csvdata&lastNObservations=1"
 )
 
-db = firestore.Client()
+# PostgreSQL connection configuration
+DB_HOST = os.getenv("DB_HOST", "34.78.76.12")
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "postgres")
+DB_USER = os.getenv("DB_USER", "exchange_rates_db")
+DB_PASSWORD = os.getenv("DB_PASSWORD", f"_%aV?H1(S,99>ohE")
+# Alternative: use a full connection string if provided
+DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
 
+# Connection pool
+_connection_pool: Optional[SimpleConnectionPool] = None
+
+
+def get_connection_pool():
+    """Initialize and return a connection pool."""
+    global _connection_pool
+    if _connection_pool is None:
+        if DB_CONNECTION_STRING:
+            conn_string = DB_CONNECTION_STRING
+        else:
+            if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
+                raise ValueError(
+                    "Database configuration missing. Set DB_HOST, DB_NAME, DB_USER, DB_PASSWORD "
+                    "or provide DB_CONNECTION_STRING"
+                )
+            conn_string = (
+                f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
+                f"user={DB_USER} password={DB_PASSWORD}"
+            )
+        _connection_pool = SimpleConnectionPool(1, 10, conn_string)
+    return _connection_pool
+
+
+@contextmanager
+def get_db_connection():
+    """Get a database connection from the pool."""
+    pool = get_connection_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        pool.putconn(conn)
 
 # ---- Helpers ----
-def _today_utc_iso_date() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
-
-
 def fetch_ecb_latest_csv() -> Dict:
     """
     Fetch latest daily FX reference rates from ECB as CSV.
@@ -46,6 +88,7 @@ def fetch_ecb_latest_csv() -> Dict:
     reader = csv.DictReader(io.StringIO(text))
 
     rates: Dict[str, float] = {}
+    dates: Dict[str, str] = {}  # Track date for each currency
     found_date: Optional[str] = None
 
     for row in reader:
@@ -53,60 +96,189 @@ def fetch_ecb_latest_csv() -> Dict:
         # - "TIME_PERIOD"
         # - "CURRENCY"
         # - "OBS_VALUE"
-        date = row.get("TIME_PERIOD")
-        ccy = row.get("CURRENCY")
-        val = row.get("OBS_VALUE")
+        date = row.get("TIME_PERIOD", "").strip() if row.get("TIME_PERIOD") else None
+        ccy = row.get("CURRENCY", "").strip() if row.get("CURRENCY") else None
+        val = row.get("OBS_VALUE", "").strip() if row.get("OBS_VALUE") else None
 
         if not date or not ccy or not val:
             continue
 
-        # Should all be same date due to lastNObservations=1
-        found_date = found_date or date
+        # Track date for each currency individually
+        dates[ccy] = date
+        found_date = found_date or date  # Keep for backward compatibility
 
         try:
             rates[ccy] = float(val)
         except ValueError:
             continue
+    
+    # Log a sample of dates to verify they're being extracted correctly
+    if dates:
+        sample_items = list(dates.items())[:3]
+        logger.info(f"Sample extracted dates: {sample_items}")
 
     if not found_date or not rates:
         raise RuntimeError("ECB response parsed but no rates found")
 
     return {
-        "date": found_date,
+        "date": found_date,  # Keep for backward compatibility
         "base": "EUR",
         "rates": rates,
+        "dates": dates,  # Add per-currency dates
         "source": "ECB",
     }
 
 
 def store_snapshot(snapshot: Dict) -> None:
-    doc_id = snapshot["date"]  # "YYYY-MM-DD"
-    snapshot = {
-        **snapshot,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }
-    db.collection(FIRESTORE_COLLECTION).document(doc_id).set(snapshot)
+    """
+    Store exchange rates snapshot in PostgreSQL.
+    Inserts/updates rows in exchange_rates table for each currency.
+    Uses the date specific to each currency if available, otherwise falls back to the snapshot date.
+    Skips currencies with dates older than the current date.
+    """
+    default_date = snapshot["date"]
+    rates = snapshot.get("rates", {})
+    dates = snapshot.get("dates", {})  # Per-currency dates
+    current_date = date.today() - timedelta(days=1)
+    
+    logger.info(f"Current date: {current_date}, Default date: {default_date}, Per-currency dates available: {len(dates)}")
+    
+    skipped_count = 0
+    stored_count = 0
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Use INSERT ... ON CONFLICT to upsert
+                # Note: This assumes a UNIQUE constraint on (currency_code, date) in the exchange_rates table
+                for currency_code, exchange_rate in rates.items():
+                    # Use currency-specific date if available, otherwise use default date
+                    currency_date_str = dates.get(currency_code, default_date)
+                    if currency_code not in dates:
+                        logger.debug(f"Currency {currency_code} not found in dates dict, using default date {default_date}")
+                    
+                    # Parse the date string and compare with current date
+                    try:
+                        currency_date = datetime.strptime(currency_date_str, "%Y-%m-%d").date()
+                        # Skip if the currency date is older than current date
+                        if currency_date < current_date:
+                            skipped_count += 1
+                            logger.debug(f"Skipping {currency_code} with date {currency_date_str} (older than current date {current_date})")
+                            continue
+                    except ValueError as e:
+                        # If date parsing fails, log and skip this currency
+                        logger.warning(f"Invalid date format for {currency_code}: {currency_date_str} - {e}")
+                        skipped_count += 1
+                        continue
+                    
+                    stored_count += 1
+                    cur.execute(
+                        """
+                        INSERT INTO exchange_rates (currency_code, date, exchange_rate)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (currency_code, date) 
+                        DO UPDATE SET 
+                            exchange_rate = EXCLUDED.exchange_rate,
+                        """,
+                        (currency_code, currency_date_str, exchange_rate),
+                    )
+            conn.commit()
+            logger.info(f"Stored {stored_count} exchange rates (skipped {skipped_count} with dates older than current date)")
+    except Exception as e:
+        logger.error(f"Error storing snapshot: {str(e)}", exc_info=True)
+        raise
 
 
 def load_snapshot(date: str) -> Optional[Dict]:
-    doc = db.collection(FIRESTORE_COLLECTION).document(date).get()
-    if not doc.exists:
+    """
+    Load exchange rates snapshot for a specific date from PostgreSQL.
+    Returns the snapshot in the same format as before.
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT currency_code, exchange_rate, status, source
+                FROM exchange_rates
+                WHERE date = %s AND status = 'active'
+                ORDER BY currency_code
+                """,
+                (date,),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
         return None
-    return doc.to_dict()
+
+    # Reconstruct the snapshot format
+    rates = {row["currency_code"]: float(row["exchange_rate"]) for row in rows}
+    # Get source from first row (should be same for all)
+    source = rows[0]["source"] if rows else "ECB"
+
+    return {
+        "date": date,
+        "base": "EUR",
+        "rates": rates,
+        "source": source,
+        "fetched_at": None,  # Not stored per-row, could add if needed
+    }
 
 
 def load_latest_snapshot() -> Optional[Dict]:
-    # Query latest by date string (ISO YYYY-MM-DD sorts lexicographically)
-    q = (
-        db.collection(FIRESTORE_COLLECTION)
-        .order_by("date", direction=firestore.Query.DESCENDING)
-        .limit(1)
-        .stream()
-    )
-    docs = list(q)
-    if not docs:
+    """
+    Load the latest exchange rates snapshot from PostgreSQL.
+    Gets the most recent date and all currencies for that date.
+    """
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # First, get the latest date
+            cur.execute(
+                """
+                SELECT MAX(date) as latest_date
+                FROM exchange_rates
+                WHERE status = 'active'
+                """
+            )
+            result = cur.fetchone()
+            if not result or not result["latest_date"]:
+                return None
+
+            latest_date = result["latest_date"]
+
+            # Then get all rates for that date
+            cur.execute(
+                """
+                SELECT currency_code, exchange_rate, status, source
+                FROM exchange_rates
+                WHERE date = %s AND status = 'active'
+                ORDER BY currency_code
+                """,
+                (latest_date,),
+            )
+            rows = cur.fetchall()
+
+    if not rows:
         return None
-    return docs[0].to_dict()
+
+    # Reconstruct the snapshot format
+    rates = {row["currency_code"]: float(row["exchange_rate"]) for row in rows}
+    source = rows[0]["source"] if rows else "ECB"
+
+    # Convert date to string format (PostgreSQL may return date object)
+    if isinstance(latest_date, datetime):
+        date_str = latest_date.date().isoformat()
+    elif hasattr(latest_date, "isoformat"):
+        date_str = latest_date.isoformat()
+    else:
+        date_str = str(latest_date)
+
+    return {
+        "date": date_str,
+        "base": "EUR",
+        "rates": rates,
+        "source": source,
+        "fetched_at": None,  # Not stored per-row, could add if needed
+    }
 
 
 def convert_amount(amount: float, from_ccy: str, to_ccy: str, rates: Dict[str, float]) -> float:
@@ -142,6 +314,18 @@ def convert_amount(amount: float, from_ccy: str, to_ccy: str, rates: Dict[str, f
 def health():
     return {"ok": True}
 
+@app.get("/test/db")
+def test_db():
+    """Test database connection."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                result = cur.fetchone()
+        return {"status": "ok", "message": "Database connection successful"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}, 500
+
 
 @app.post("/tasks/update")
 def update_rates(x_update_token: Optional[str] = Header(default=None)):
@@ -149,13 +333,29 @@ def update_rates(x_update_token: Optional[str] = Header(default=None)):
     Called by Cloud Scheduler (or manually) to fetch and store the latest ECB snapshot.
     Protect this endpoint using UPDATE_TOKEN (or Cloud Run IAM).
     """
-    if UPDATE_TOKEN:
-        if not x_update_token or x_update_token != UPDATE_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        if UPDATE_TOKEN:
+            if not x_update_token or x_update_token != UPDATE_TOKEN:
+                raise HTTPException(status_code=401, detail="Unauthorized")
 
-    snapshot = fetch_ecb_latest_csv()
-    store_snapshot(snapshot)
-    return {"stored": True, "date": snapshot["date"], "base": snapshot["base"], "count": len(snapshot["rates"])}
+        logger.info("Fetching ECB rates...")
+        snapshot = fetch_ecb_latest_csv()
+        dates = snapshot.get("dates", {})
+        logger.info(f"Fetched snapshot for date: {snapshot['date']}, {len(snapshot['rates'])} rates")
+        if dates:
+            sample_dates = list(dates.items())[:5]
+            logger.info(f"Sample per-currency dates: {sample_dates}")
+        
+        logger.info("Storing snapshot to database...")
+        store_snapshot(snapshot)
+        logger.info("Successfully stored snapshot")
+        
+        return {"stored": True, "date": snapshot["date"], "base": snapshot["base"], "count": len(snapshot["rates"])}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in update_rates: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
 
 @app.get("/rates/latest")
@@ -187,10 +387,12 @@ def convert(
         raise HTTPException(status_code=404, detail="No rates available. Call /tasks/update first.")
 
     rates = snap.get("rates", {})
+
     try:
         result = convert_amount(amount, from_ccy, to_ccy, rates)
     except KeyError as e:
-        raise HTTPException(status_code=400, detail=f"Unsupported currency: {str(e).strip('\"')}")
+        currency = str(e).strip('"')
+        raise HTTPException(status_code=400, detail=f"Unsupported currency: {currency}")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
