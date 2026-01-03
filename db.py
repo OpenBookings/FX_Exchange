@@ -29,7 +29,24 @@ def get_connection_pool(method: str):
                 raise ValueError(
                     "Database configuration missing. Set DB_CONNECTION_STRING environment variable"
                 )
-            _connection_pool = pool.SimpleConnectionPool(1, 10, DB_CONNECTION_STRING)
+            # Check if DB_CONNECTION_STRING is a Unix socket path (Google Cloud SQL)
+            if DB_CONNECTION_STRING.startswith("/cloudsql/") or DB_CONNECTION_STRING.startswith("/tmp/cloudsql/"):
+                # For Unix socket connections, use the socket path as host
+                # and require other connection parameters
+                if not (DB_NAME and DB_USER and DB_PASSWORD):
+                    raise ValueError(
+                        "For Unix socket connections, DB_NAME, DB_USER, and DB_PASSWORD must be set"
+                    )
+                _connection_pool = pool.SimpleConnectionPool(
+                    1, 10,
+                    host=DB_CONNECTION_STRING,
+                    database=DB_NAME,
+                    user=DB_USER,
+                    password=DB_PASSWORD
+                )
+            else:
+                # Standard connection string format
+                _connection_pool = pool.SimpleConnectionPool(1, 10, DB_CONNECTION_STRING)
         return _connection_pool
     elif method == "development":
         print("Development connection pool")
