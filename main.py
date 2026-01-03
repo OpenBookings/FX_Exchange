@@ -7,6 +7,10 @@ import conversion
 
 app = flask.Flask(__name__)
 
+@app.route("/health", methods=["GET"])
+def health_check():
+    return flask.jsonify({"status": "healthy"}), 200
+
 @app.route("/update", methods=["GET"])
 def update_exchange_rates():
     base_data = update.fetch_ecb_csv()

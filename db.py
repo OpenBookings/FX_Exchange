@@ -15,7 +15,7 @@ INSTANCE_CONNECTION_NAME = os.getenv(
 
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_USER = os.getenv("DB_USER", "exchange_rates_db")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "Byz^NsKnMjBb6/tO")
 
 # Local / TCP fallback
 DB_HOST = os.getenv("DB_HOST", "34.78.76.12")
@@ -44,6 +44,14 @@ def _create_connection_pool(dsn, use_socket=False):
             dsn=dsn,
         )
     except OperationalError as e:
+        error_msg = str(e)
+        if "password authentication failed" in error_msg.lower():
+            logger.error(
+                f"Database authentication failed. Please verify:\n"
+                f"1. DB_USER is correct (current: {DB_USER})\n"
+                f"2. DB_PASSWORD is correct\n"
+                f"3. User has proper permissions on database '{DB_NAME}'"
+            )
         if use_socket:
             logger.warning(f"Failed to create connection pool with Unix socket: {e}")
             logger.info("Falling back to TCP connection")
