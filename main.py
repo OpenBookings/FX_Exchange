@@ -13,7 +13,7 @@ def update_exchange_rates():
     base_data = update.fetch_ecb_csv()
     prepared_data = update.prepare_data_for_database(base_data)
     print(prepared_data)
-    with db.get_db_connection(method) as conn:
+    with db.get_db_connection() as conn:
         if input("Are you sure you want to insert data into database? (y/n): ") == "y":
             update.insert_data_into_database(prepared_data, conn)
             return flask.jsonify({"message": "Data inserted into database"}), 200
@@ -28,7 +28,7 @@ def convert_amount():
     method = 'production'
     
     try:
-        with db.get_db_connection(method) as conn:
+        with db.get_db_connection() as conn:
             result = convertion.convert_amount(amount, from_ccy, to_ccy, conn)
         return flask.jsonify({
             "amount": result,
