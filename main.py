@@ -6,8 +6,9 @@ from typing import Dict, Optional
 from contextlib import contextmanager
 
 import requests
-from psycopg2.extras import RealDictCursor
-from psycopg2.pool import SimpleConnectionPool
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 from fastapi import FastAPI, HTTPException, Query, Header
 import logging
 
@@ -25,7 +26,7 @@ ECB_CSV_URL = (
 )
 
 # PostgreSQL connection configuration
-# Either DB_CONNECTION_STRING or individual DB_* variables must be set
+# Option 1: Full connection string (highest priority)
 DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT", "5432")  # Default port is standard
@@ -33,8 +34,19 @@ DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
+# Option 2: Individual connection parameters
+# For Cloud SQL: leave DB_HOST unset to use Unix socket, or set DB_CLOUD_SQL_INSTANCE
+DB_HOST = os.getenv("DB_HOST")  # TCP connection host (IP or hostname)
+DB_PORT = os.getenv("DB_PORT", "5432")  # Default PostgreSQL port
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# Cloud SQL Unix socket configuration (used when DB_HOST is not set)
+DB_CLOUD_SQL_INSTANCE = os.getenv("DB_CLOUD_SQL_INSTANCE")  # e.g., "openbookings:europe-west1:openbookings-db"
+
 # Connection pool
-_connection_pool: Optional[SimpleConnectionPool] = None
+_connection_pool: Optional[ConnectionPool] = None
 
 
 def get_connection_pool():
@@ -42,18 +54,44 @@ def get_connection_pool():
     global _connection_pool
     if _connection_pool is None:
         if DB_CONNECTION_STRING:
+            # Use full connection string if provided
             conn_string = DB_CONNECTION_STRING
         else:
-            if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
+            # Validate required parameters
+            if not all([DB_NAME, DB_USER, DB_PASSWORD]):
+                missing = [k for k, v in {
+                    "DB_NAME": DB_NAME,
+                    "DB_USER": DB_USER,
+                    "DB_PASSWORD": DB_PASSWORD
+                }.items() if not v]
                 raise ValueError(
                     "Database configuration missing. Set DB_HOST, DB_NAME, DB_USER, DB_PASSWORD "
                     "or provide DB_CONNECTION_STRING environment variable"
                 )
-            conn_string = (
-                f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
-                f"user={DB_USER} password={DB_PASSWORD}"
-            )
-        _connection_pool = SimpleConnectionPool(1, 10, conn_string)
+            
+            # Determine connection method
+            if DB_HOST:
+                # TCP connection (standard PostgreSQL connection)
+                conn_string = (
+                    f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
+                    f"user={DB_USER} password={DB_PASSWORD}"
+                )
+            elif DB_CLOUD_SQL_INSTANCE:
+                # Cloud SQL Unix socket connection
+                socket_path = f"/cloudsql/{DB_CLOUD_SQL_INSTANCE}"
+                conn_string = (
+                    f"host={socket_path} dbname={DB_NAME} "
+                    f"user={DB_USER} password={DB_PASSWORD}"
+                )
+            else:
+                raise ValueError(
+                    "Database connection method not specified. "
+                    "Set either DB_HOST (for TCP connection) or DB_CLOUD_SQL_INSTANCE "
+                    "(for Cloud SQL Unix socket connection), or provide DB_CONNECTION_STRING."
+                )
+        
+        logger.info("Initializing database connection pool...")
+        _connection_pool = ConnectionPool(conn_string, min_size=1, max_size=10)
     return _connection_pool
 
 
@@ -195,7 +233,7 @@ def load_snapshot(date: str) -> Optional[Dict]:
     Returns the snapshot in the same format as before.
     """
     with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 """
                 SELECT currency_code, exchange_rate, status, source
@@ -230,7 +268,7 @@ def load_latest_snapshot() -> Optional[Dict]:
     Gets the most recent date and all currencies for that date.
     """
     with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             # First, get the latest date
             cur.execute(
                 """
@@ -319,12 +357,13 @@ def health():
 def update_rates(x_update_token: Optional[str] = Header(default=None)):
     """
     Called by Cloud Scheduler (or manually) to fetch and store the latest ECB snapshot.
-    Protected by UPDATE_TOKEN environment variable.
+    Protected by UPDATE_TOKEN environment variable (or Cloud Run IAM).
     """
     # Validate authentication token
-    if UPDATE_TOKEN:
-        if not x_update_token or x_update_token != UPDATE_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    if not UPDATE_TOKEN:
+        logger.warning("UPDATE_TOKEN not set - endpoint is unprotected")
+    elif not x_update_token or x_update_token != UPDATE_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing update token")
 
     try:
         logger.info("Fetching ECB rates...")
