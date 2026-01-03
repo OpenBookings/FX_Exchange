@@ -3,7 +3,7 @@ import flask
 # CUSTOM MODULES
 import db
 import update
-import convertion
+import conversion
 
 app = flask.Flask(__name__)
 
@@ -24,7 +24,7 @@ def convert_amount():
     
     try:
         with db.get_db_connection() as conn:
-            result = convertion.convert_amount(amount, from_ccy, to_ccy, conn)
+            result = conversion.convert_amount(amount, from_ccy, to_ccy, conn)
         return flask.jsonify({
             "amount": result,
             "from": from_ccy,
