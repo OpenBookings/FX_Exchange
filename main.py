@@ -1,7 +1,7 @@
 import os
 import io
 import csv
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, date, timedelta
 from typing import Dict, Optional
 from contextlib import contextmanager
 
@@ -18,20 +18,20 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="ECB FX Service", version="1.0.0")
 
 # ---- Config ----
-UPDATE_TOKEN = os.getenv("UPDATE_TOKEN", "TESTING")  # set this in Cloud Run env vars
+UPDATE_TOKEN = os.getenv("UPDATE_TOKEN")
 ECB_CSV_URL = (
     "https://data-api.ecb.europa.eu/service/data/EXR/D..EUR.SP00.A"
     "?format=csvdata&lastNObservations=1"
 )
 
 # PostgreSQL connection configuration
-DB_HOST = os.getenv("DB_HOST", "34.78.76.12")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "postgres")
-DB_USER = os.getenv("DB_USER", "exchange_rates_db")
-DB_PASSWORD = os.getenv("DB_PASSWORD", f"_%aV?H1(S,99>ohE")
-# Alternative: use a full connection string if provided
+# Either DB_CONNECTION_STRING or individual DB_* variables must be set
 DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT", "5432")  # Default port is standard
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 # Connection pool
 _connection_pool: Optional[SimpleConnectionPool] = None
@@ -47,7 +47,7 @@ def get_connection_pool():
             if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
                 raise ValueError(
                     "Database configuration missing. Set DB_HOST, DB_NAME, DB_USER, DB_PASSWORD "
-                    "or provide DB_CONNECTION_STRING"
+                    "or provide DB_CONNECTION_STRING environment variable"
                 )
             conn_string = (
                 f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} "
@@ -178,7 +178,7 @@ def store_snapshot(snapshot: Dict) -> None:
                         VALUES (%s, %s, %s)
                         ON CONFLICT (currency_code, date) 
                         DO UPDATE SET 
-                            exchange_rate = EXCLUDED.exchange_rate,
+                            exchange_rate = EXCLUDED.exchange_rate
                         """,
                         (currency_code, currency_date_str, exchange_rate),
                     )
@@ -314,65 +314,38 @@ def convert_amount(amount: float, from_ccy: str, to_ccy: str, rates: Dict[str, f
 def health():
     return {"ok": True}
 
-@app.get("/test/db")
-def test_db():
-    """Test database connection."""
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-                result = cur.fetchone()
-        return {"status": "ok", "message": "Database connection successful"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
-
 
 @app.post("/tasks/update")
 def update_rates(x_update_token: Optional[str] = Header(default=None)):
     """
     Called by Cloud Scheduler (or manually) to fetch and store the latest ECB snapshot.
-    Protect this endpoint using UPDATE_TOKEN (or Cloud Run IAM).
+    Protected by UPDATE_TOKEN environment variable.
     """
-    try:
-        if UPDATE_TOKEN:
-            if not x_update_token or x_update_token != UPDATE_TOKEN:
-                raise HTTPException(status_code=401, detail="Unauthorized")
+    # Validate authentication token
+    if UPDATE_TOKEN:
+        if not x_update_token or x_update_token != UPDATE_TOKEN:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
+    try:
         logger.info("Fetching ECB rates...")
         snapshot = fetch_ecb_latest_csv()
-        dates = snapshot.get("dates", {})
         logger.info(f"Fetched snapshot for date: {snapshot['date']}, {len(snapshot['rates'])} rates")
-        if dates:
-            sample_dates = list(dates.items())[:5]
-            logger.info(f"Sample per-currency dates: {sample_dates}")
         
         logger.info("Storing snapshot to database...")
         store_snapshot(snapshot)
         logger.info("Successfully stored snapshot")
         
-        return {"stored": True, "date": snapshot["date"], "base": snapshot["base"], "count": len(snapshot["rates"])}
+        return {
+            "stored": True,
+            "date": snapshot["date"],
+            "base": snapshot["base"],
+            "count": len(snapshot["rates"])
+        }
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error in update_rates: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
-
-
-@app.get("/rates/latest")
-def rates_latest():
-    snap = load_latest_snapshot()
-    if not snap:
-        raise HTTPException(status_code=404, detail="No rates stored yet. Call /tasks/update first.")
-    return snap
-
-
-@app.get("/rates/{date}")
-def rates_by_date(date: str):
-    snap = load_snapshot(date)
-    if not snap:
-        raise HTTPException(status_code=404, detail=f"No rates found for {date}")
-    return snap
-
 
 @app.get("/convert")
 def convert(
