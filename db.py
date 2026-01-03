@@ -1,78 +1,80 @@
 import os
-from typing import Optional
-from contextlib import contextmanager
-from psycopg2 import pool
 import psycopg2
+from psycopg2 import pool
+from contextlib import contextmanager
 
-# PostgreSQL connection configuration
-# Either DB_CONNECTION_STRING or individual DB_* variables must be set
-# For production, prefer DB_CONNECTION_STRING for security and flexibility
-DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING")
-DB_HOST = os.getenv("DB_HOST", "34.78.76.12")
-DB_PORT = os.getenv("DB_PORT", "5432")  # Default port is standard
+# ---- Configuration ----
+
+INSTANCE_CONNECTION_NAME = os.getenv(
+    "INSTANCE_CONNECTION_NAME",
+    "openbookings:europe-west1:openbookings-db",
+)
+
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_USER = os.getenv("DB_USER", "exchange_rates_db")
-DB_PASSWORD = os.getenv("DB_PASSWORD", f"FFF@,OvOqBru6A)j")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Connection pool
-_connection_pool: Optional[pool.SimpleConnectionPool] = None
+# Local / TCP fallback
+DB_HOST = os.getenv("DB_HOST", "34.78.76.12")
+DB_PORT = os.getenv("DB_PORT", "5432")
+
+# ---- Connection pool (keep VERY small on Cloud Run) ----
+
+_connection_pool = None
 
 
-def get_connection_pool(method: str):
-    """Initialize and return a connection pool."""
+def _create_connection():
+    """
+    Creates a new database connection.
+    Uses Unix socket on Cloud Run, TCP locally.
+    """
+
+    # Cloud Run / Cloud SQL (Unix socket)
+    if os.path.exists("/cloudsql"):
+        return psycopg2.connect(
+            host=f"/cloudsql/{INSTANCE_CONNECTION_NAME}",
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+        )
+
+    # Local development / fallback (TCP)
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        sslmode="require",
+    )
+
+
+def get_connection_pool():
     global _connection_pool
 
-    if method == "production":
-        print("Production connection pool")
-        if _connection_pool is None:
-            if not DB_CONNECTION_STRING:
-                raise ValueError(
-                    "Database configuration missing. Set DB_CONNECTION_STRING environment variable"
-                )
-            # Check if DB_CONNECTION_STRING is a Unix socket path (Google Cloud SQL)
-            if DB_CONNECTION_STRING.startswith("/cloudsql/") or DB_CONNECTION_STRING.startswith("/tmp/cloudsql/"):
-                # For Unix socket connections, use the socket path as host
-                # and require other connection parameters
-                if not (DB_NAME and DB_USER and DB_PASSWORD):
-                    raise ValueError(
-                        "For Unix socket connections, DB_NAME, DB_USER, and DB_PASSWORD must be set"
-                    )
-                _connection_pool = pool.SimpleConnectionPool(
-                    1, 10,
-                    host=DB_CONNECTION_STRING,
-                    database=DB_NAME,
-                    user=DB_USER,
-                    password=DB_PASSWORD
-                )
-            else:
-                # Standard connection string format
-                _connection_pool = pool.SimpleConnectionPool(1, 10, DB_CONNECTION_STRING)
-        return _connection_pool
-    elif method == "development":
-        print("Development connection pool")
-        if _connection_pool is None:
-            if not (DB_HOST and DB_PORT and DB_NAME and DB_USER and DB_PASSWORD):
-                raise ValueError(
-                    "Database configuration missing. Set DB_HOST, DB_PORT, DB_NAME, DB_USER, and DB_PASSWORD (or *_DEVELOPMENT variants) environment variables"
-                )
-            _connection_pool = pool.SimpleConnectionPool(
-                1, 10,
-                host=DB_HOST,
-                port=DB_PORT,
-                database=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD
-            )
-        return _connection_pool
-    else:
-        raise ValueError(f"Invalid method: {method}")
+    if _connection_pool is None:
+        _connection_pool = pool.SimpleConnectionPool(
+            minconn=1,
+            maxconn=2,  # IMPORTANT: keep this tiny on Cloud Run
+            connection_factory=_create_connection,
+        )
+
+    return _connection_pool
+
 
 @contextmanager
-def get_db_connection(method: str):
-    """Get a database connection from the pool."""
-    pool_instance = get_connection_pool(method)
+def get_db_connection():
+    """
+    Context manager that safely gets and returns a connection.
+    """
+    pool_instance = get_connection_pool()
     conn = pool_instance.getconn()
+
     try:
         yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         pool_instance.putconn(conn)
