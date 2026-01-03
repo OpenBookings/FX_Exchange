@@ -48,4 +48,3 @@ exchange_rate = EXCLUDED.exchange_rate
 def insert_data_into_database(data, conn):
     with conn.cursor() as cursor:
         cursor.executemany(sql_insert, data)
-        conn.commit()
