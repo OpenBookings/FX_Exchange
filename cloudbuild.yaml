@@ -1,0 +1,49 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+    - build
+    - '-t'
+    - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA'
+    - '.'
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+    - push
+    - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA'
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    args:
+    - run
+    - deploy
+    - $_SERVICE_NAME
+    - '--image'
+    - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA'
+    - '--region'
+    - $_DEPLOY_REGION
+    - '--platform'
+    - $_PLATFORM
+    - '--port'
+    - '8080'
+    - '--memory'
+    - '512Mi'
+    - '--cpu'
+    - '1'
+    - '--min-instances'
+    - '0'
+    - '--max-instances'
+    - '10'
+    - '--timeout'
+    - '300s'
+    - '--concurrency'
+    - '80'
+    - '--allow-unauthenticated'
+    - '--add-cloudsql-instances'
+    - 'openbookings:europe-west1:openbookings-db'
+    - '--revision-suffix'
+    - '$COMMIT_SHA'
+    entrypoint: gcloud
+timeout: 1200s
+images:
+- '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPOSITORY/$_SERVICE_NAME:$COMMIT_SHA'
+options:
+  logging: CLOUD_LOGGING_ONLY

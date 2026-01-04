@@ -1,6 +1,7 @@
 import os
 import logging
-from psycopg2 import pool, OperationalError
+from google.cloud.sql.connector import Connector
+import sqlalchemy
 from contextlib import contextmanager
 
 # Set up logging
@@ -15,123 +16,112 @@ INSTANCE_CONNECTION_NAME = os.getenv(
 
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_USER = os.getenv("DB_USER", "exchange_rates_db")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "Byz^NsKnMjBb6/tO")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
 
-# Local / TCP fallback
-DB_HOST = os.getenv("DB_HOST", "34.78.76.12")
-DB_PORT = os.getenv("DB_PORT", "5432")
+# Security: Require password from environment variable or Secret Manager
+if not DB_PASSWORD:
+    logger.error("DB_PASSWORD environment variable is not set")
+    raise ValueError("DB_PASSWORD environment variable is required for database connection")
 
-# ---- Connection pool (keep VERY small on Cloud Run) ----
+# IP type for Cloud SQL connection (PUBLIC or PRIVATE)
+IP_TYPE = os.getenv("IP_TYPE", "PUBLIC")
 
-_connection_pool = None
+# ---- Connection setup ----
 
-def _get_socket_path():
-    """Get the Unix socket path for Cloud SQL connection."""
-    return f"/cloudsql/{INSTANCE_CONNECTION_NAME}/.s.PGSQL.5432"
+_connector = None
+_engine = None
 
-def _use_unix_socket():
-    """Check if Unix socket connection should be used."""
-    socket_path = _get_socket_path()
-    # Check if the socket file actually exists, not just the directory
-    return os.path.exists(socket_path)
+def _get_connector():
+    """Get or create the Cloud SQL Connector instance."""
+    global _connector
+    if _connector is None:
+        _connector = Connector()
+    return _connector
 
-def _create_connection_pool(dsn, use_socket=False):
-    """Create a connection pool with the given DSN."""
+def _getconn():
+    """Create a connection using the Cloud SQL Connector."""
+    logger.debug(f"Attempting to connect to Cloud SQL instance: {INSTANCE_CONNECTION_NAME}")
+    connector = _get_connector()
     try:
-        return pool.SimpleConnectionPool(
-            minconn=1,
-            maxconn=2,  # IMPORTANT: keep this tiny on Cloud Run
-            dsn=dsn,
+        conn = connector.connect(
+            INSTANCE_CONNECTION_NAME,
+            "pg8000",
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db=DB_NAME,
+            ip_type=IP_TYPE
         )
-    except OperationalError as e:
-        error_msg = str(e)
-        if "password authentication failed" in error_msg.lower():
+        logger.debug("Successfully established connection to Cloud SQL")
+        return conn
+    except Exception as e:
+        logger.error(f"Failed to connect to Cloud SQL: {e}", exc_info=True)
+        raise
+
+def get_engine():
+    """Get or create the SQLAlchemy engine."""
+    global _engine
+    if _engine is None:
+        logger.info(f"Creating SQLAlchemy engine for Cloud SQL instance: {INSTANCE_CONNECTION_NAME}")
+        _engine = sqlalchemy.create_engine(
+            "postgresql+pg8000://",
+            creator=_getconn,
+            pool_size=2,  # Keep pool small on Cloud Run
+            max_overflow=0,
+            pool_recycle=3600,  # Recycle connections after 1 hour
+            pool_pre_ping=True,  # Verify connections before using
+        )
+    return _engine
+
+@contextmanager
+def get_db_connection():
+    """
+    Context manager that safely gets and returns a database connection.
+    Handles connection failures and provides better error messages.
+    """
+    logger.debug("Getting database connection from pool")
+    engine = get_engine()
+    conn = None
+    
+    try:
+        # Get a connection from the engine and extract the underlying database connection
+        sqlalchemy_conn = engine.connect()
+        # Get the underlying database connection
+        conn = sqlalchemy_conn.connection
+        # We need to keep a reference to the SQLAlchemy connection to close it properly
+        conn._sqlalchemy_conn = sqlalchemy_conn
+        logger.debug("Database connection acquired successfully")
+    except Exception as e:
+        logger.error(f"Failed to get connection from engine: {e}", exc_info=True)
+        error_msg = str(e).lower()
+        if "password authentication failed" in error_msg:
             logger.error(
                 f"Database authentication failed. Please verify:\n"
                 f"1. DB_USER is correct (current: {DB_USER})\n"
                 f"2. DB_PASSWORD is correct\n"
                 f"3. User has proper permissions on database '{DB_NAME}'"
             )
-        if use_socket:
-            logger.warning(f"Failed to create connection pool with Unix socket: {e}")
-            logger.info("Falling back to TCP connection")
-            return None
-        raise
-
-def get_connection_pool():
-    global _connection_pool
-
-    if _connection_pool is None:
-        # Try Unix socket first (Cloud Run / Cloud SQL)
-        if _use_unix_socket():
-            socket_path = f"/cloudsql/{INSTANCE_CONNECTION_NAME}"
-            dsn = (
-                f"host={socket_path} "
-                f"dbname={DB_NAME} "
-                f"user={DB_USER} "
-                f"password={DB_PASSWORD}"
-            )
-            logger.info(f"Attempting Unix socket connection: {socket_path}")
-            _connection_pool = _create_connection_pool(dsn, use_socket=True)
-            
-            # If socket connection failed, fall back to TCP
-            if _connection_pool is None:
-                dsn = (
-                    f"host={DB_HOST} "
-                    f"port={DB_PORT} "
-                    f"dbname={DB_NAME} "
-                    f"user={DB_USER} "
-                    f"password={DB_PASSWORD} "
-                    f"sslmode=require"
-                )
-                logger.info(f"Using TCP connection: {DB_HOST}:{DB_PORT}")
-                _connection_pool = _create_connection_pool(dsn, use_socket=False)
-        else:
-            # Local development / fallback (TCP)
-            dsn = (
-                f"host={DB_HOST} "
-                f"port={DB_PORT} "
-                f"dbname={DB_NAME} "
-                f"user={DB_USER} "
-                f"password={DB_PASSWORD} "
-                f"sslmode=require"
-            )
-            logger.info(f"Using TCP connection (socket not available): {DB_HOST}:{DB_PORT}")
-            _connection_pool = _create_connection_pool(dsn, use_socket=False)
-
-    return _connection_pool
-
-@contextmanager
-def get_db_connection():
-    """
-    Context manager that safely gets and returns a connection.
-    Handles connection failures and provides better error messages.
-    """
-    pool_instance = get_connection_pool()
-    conn = None
-    
-    try:
-        conn = pool_instance.getconn()
-    except OperationalError as e:
-        logger.error(f"Failed to get connection from pool: {e}")
-        # If this is a connection refused error, it might mean the socket isn't working
-        # even though it exists. This could indicate Cloud SQL isn't properly configured.
-        if "Connection refused" in str(e) or "connection to server" in str(e).lower():
+        elif "connection" in error_msg or "connect" in error_msg:
             logger.error(
-                "Cloud SQL connection refused. Please verify:\n"
+                "Cloud SQL connection failed. Please verify:\n"
                 "1. Cloud Run service has Cloud SQL connection configured\n"
                 "2. Cloud SQL instance allows connections from this service\n"
-                "3. Database credentials are correct"
+                "3. Database credentials are correct\n"
+                f"4. IP_TYPE is set correctly (current: {IP_TYPE})\n"
+                f"5. For cross-project access, ensure service account has 'roles/cloudsql.client' role"
             )
         raise
 
     try:
         yield conn
         conn.commit()
-    except Exception:
+        logger.debug("Database transaction committed successfully")
+    except Exception as e:
+        logger.warning(f"Database transaction failed, rolling back: {e}")
         if conn:
             conn.rollback()
         raise
     finally:
-        if conn:
-            pool_instance.putconn(conn)
+        if conn and hasattr(conn, '_sqlalchemy_conn'):
+            # Close the SQLAlchemy connection wrapper
+            conn._sqlalchemy_conn.close()
+            logger.debug("Database connection closed")
