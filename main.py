@@ -29,10 +29,19 @@ def health_check():
             cursor.fetchone()
             cursor.close()
         logger.info("Health check passed - database connection successful")
-        return flask.jsonify({"status": "healthy", "database": "connected"}), 200
+        return flask.jsonify({
+            "status": "healthy",
+            "database": "connected",
+            "db_name": db.DB_NAME
+        }), 200
     except Exception as e:
         logger.error(f"Health check failed: {e}", exc_info=True)
-        return flask.jsonify({"status": "unhealthy", "database": "disconnected", "error": str(e)}), 503
+        return flask.jsonify({
+            "status": "unhealthy",
+            "database": "disconnected",
+            "db_name": db.DB_NAME,
+            "error": str(e)
+        }), 503
 
 #test db connection 
 @app.route("/test-db", methods=["GET"]) 
